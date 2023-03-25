@@ -4,63 +4,88 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use heck::ToShoutySnakeCase;
+use notify_rust::{Hint, Notification};
 use rand_core::OsRng;
 use rand_distr::Distribution;
 use rand_distr::Uniform;
+use tracing::{error, info, warn, Level};
+use tracing_unwrap::{OptionExt, ResultExt};
 
-const APP_NAME: &str = "Random Background";
+use EnvVar::{CacheFile, WallpaperChanger, WallpaperFolder};
 
-const COMMAND_BACKGROUND_CHANGER: &str = "swww";
-const COMMAND_NOTIFY_SEND: &str = "notify-send";
+const APP_NAME: &str = "Random Wallpaper";
 
 const TRANSITION_TYPE: &str = "any";
 const TRANSITION_STEP: &str = "30";
 const TRANSITION_DURATION: &str = "3";
 const TRANSITION_FPS: &str = "165";
 
-const EXPIRE_TIME: &str = "3000";
+const EXPIRE_TIME: i32 = 3000;
 
-const ENV_VAR_NAME_CACHE_FILE_PATH: &str = "RB_CACHE_FILE_PATH";
-const ENV_VAR_NAME_WALLPAPER_DIRECTORY_PATH: &str = "RB_WALLPAPER_DIRECTORY_PATH";
+#[derive(Debug)]
+enum EnvVar {
+    CacheFile,
+    WallpaperFolder,
+    WallpaperChanger,
+}
 
-fn get_cache_file_path() -> PathBuf {
-    let env_cache_file_path = env::var(ENV_VAR_NAME_CACHE_FILE_PATH);
-    let mut path = "~/.background".to_string();
-
-    if let Ok(env_path) = env_cache_file_path {
-        path = env_path
+impl ToString for EnvVar {
+    #[tracing::instrument]
+    fn to_string(&self) -> String {
+        format!("RW_{:?}", self).to_shouty_snake_case()
     }
+}
 
+fn setup_tracing_subscriber() {
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Failed to set global tracing subscriber");
+}
+
+#[tracing::instrument]
+fn get_value_from_env_var_or_default(env_var: EnvVar, default: &str) -> String {
+    let env_value_result = env::var(env_var.to_string());
+    if let Ok(env_value) = env_value_result {
+        return env_value;
+    }
+    default.to_string()
+}
+
+#[tracing::instrument]
+fn get_cache_file_path() -> PathBuf {
+    let path = get_value_from_env_var_or_default(CacheFile, "~/.wallpaper");
     PathBuf::from(shellexpand::tilde(&path).to_string())
 }
 
-fn get_previously_selected_background(cache_file_path: &PathBuf) -> String {
-    let mut previous_background = String::new();
+#[tracing::instrument]
+fn get_previously_used_wallpaper(cache_file_path: &PathBuf) -> String {
+    let mut previous_wallpaper = String::new();
     if let Ok(mut file) = File::open(cache_file_path) {
         BufReader::new(&mut file)
-            .read_to_string(&mut previous_background)
-            .expect("Failed to read cache file.");
+            .read_to_string(&mut previous_wallpaper)
+            .expect_or_log("Failed to read cache file.");
+
+        info!("Previously used wallpaper: {}", previous_wallpaper)
     }
-    previous_background
+    previous_wallpaper
 }
 
+#[tracing::instrument]
 fn get_wallpaper_directory_path() -> PathBuf {
-    let env_wallpaper_directory_path = env::var(ENV_VAR_NAME_WALLPAPER_DIRECTORY_PATH);
-    let mut path = "~/Pictures/wallpapers".to_string();
-
-    if let Ok(env_path) = env_wallpaper_directory_path {
-        path = env_path;
-    }
-
+    let path = get_value_from_env_var_or_default(WallpaperFolder, "~/Pictures/wallpapers");
     PathBuf::from(shellexpand::tilde(&path).to_string())
 }
 
-fn get_possible_backgrounds(
-    previous_background: String,
+#[tracing::instrument]
+fn get_possible_wallpapers(
+    previous_wallpaper: String,
     wallpaper_directory_path: &PathBuf,
 ) -> Vec<PathBuf> {
     fs::read_dir(wallpaper_directory_path)
-        .unwrap_or_else(|_| panic!("Failed to open {}", &wallpaper_directory_path.display()))
+        .expect_or_log(format!("Failed to open {}", &wallpaper_directory_path.display()).as_str())
         .filter_map(|entry| {
             if let Ok(dir_entry) = entry {
                 let path = dir_entry.path();
@@ -74,15 +99,11 @@ fn get_possible_backgrounds(
             }
         })
         .filter(|file_path| is_image(file_path))
-        .filter(|file_path| {
-            file_path
-                != wallpaper_directory_path
-                    .join(&previous_background)
-                    .as_path()
-        })
+        .filter(|file_path| file_path != Path::new(&previous_wallpaper))
         .collect::<Vec<_>>()
 }
 
+#[tracing::instrument]
 fn is_image(path: &Path) -> bool {
     match path.extension() {
         Some(ext) => {
@@ -95,32 +116,41 @@ fn is_image(path: &Path) -> bool {
     }
 }
 
-fn choose_random_background(possible_backgrounds: &Vec<PathBuf>) -> &PathBuf {
-    let distribution = Uniform::new(0, possible_backgrounds.len());
-    &possible_backgrounds[distribution.sample(&mut OsRng)]
+#[tracing::instrument]
+fn choose_random_wallpaper(possible_wallpapers: &Vec<PathBuf>) -> &PathBuf {
+    let distribution = Uniform::new(0, possible_wallpapers.len());
+    &possible_wallpapers[distribution.sample(&mut OsRng)]
 }
 
-fn get_file_name(selected_file: &&PathBuf) -> String {
+#[tracing::instrument]
+fn get_file_name(selected_file: &PathBuf) -> String {
     selected_file
         .file_name()
-        .unwrap_or_else(|| panic!("Failed to get file name from {}.", selected_file.display()))
+        .expect_or_log(
+            format!("Failed to get file name from {}.", selected_file.display()).as_str(),
+        )
         .to_string_lossy()
         .to_string()
 }
 
-fn apply_new_background(cache_file_path: &PathBuf, selected_file: &&PathBuf, file_name: String) {
-    let status = execute_background_changer(selected_file);
+#[tracing::instrument]
+fn apply_new_wallpaper(cache_file_path: &PathBuf, selected_file: &PathBuf) {
+    let command = get_value_from_env_var_or_default(WallpaperChanger, "swww");
+    let status = execute_wallpaper_changer(&command, selected_file);
 
     if status.success() {
-        update_cache(cache_file_path, &file_name);
-        send_notification(&selected_file, file_name);
-    } else {
-        println!("{} execution failed.", COMMAND_BACKGROUND_CHANGER);
+        update_cache(cache_file_path, selected_file);
+        send_wallpaper_changed_notification(selected_file);
+        info!(
+            "Wallpaper successfully changed to {}",
+            selected_file.display()
+        )
     }
 }
 
-fn execute_background_changer(selected_file: &&PathBuf) -> ExitStatus {
-    Command::new(COMMAND_BACKGROUND_CHANGER)
+#[tracing::instrument]
+fn execute_wallpaper_changer(command: &str, selected_file: &PathBuf) -> ExitStatus {
+    Command::new(command)
         .arg("img")
         .args(["--transition-type", TRANSITION_TYPE])
         .args(["--transition-step", TRANSITION_STEP])
@@ -128,45 +158,69 @@ fn execute_background_changer(selected_file: &&PathBuf) -> ExitStatus {
         .args(["--transition-fps", TRANSITION_FPS])
         .arg(selected_file)
         .status()
-        .unwrap_or_else(|_| panic!("Failed to execute {}.", COMMAND_BACKGROUND_CHANGER))
+        .expect_or_log(format!("Failed to execute {}.", command).as_str())
 }
 
-fn update_cache(cache_file_path: &PathBuf, file_name: &String) {
-    let mut cache_file = File::create(cache_file_path)
-        .unwrap_or_else(|_| panic!("Failed to create cache file {}.", cache_file_path.display()));
+#[tracing::instrument]
+fn update_cache(cache_file_path: &PathBuf, file_path: &PathBuf) {
+    let mut cache_file = File::create(cache_file_path).expect_or_log(
+        format!("Failed to create cache file {}.", cache_file_path.display()).as_str(),
+    );
 
     cache_file
-        .write_all(file_name.as_bytes())
-        .unwrap_or_else(|_| panic!("Failed to update cache in {}", cache_file_path.display()));
+        .write_all(file_path.to_string_lossy().as_bytes())
+        .expect_or_log(format!("Failed to update cache in {}", cache_file_path.display()).as_str());
 }
 
-fn send_notification(selected_file: &&&PathBuf, file_name: String) {
-    Command::new(COMMAND_NOTIFY_SEND)
-        .args(["-i", &selected_file.to_string_lossy()])
-        .args(["-t", EXPIRE_TIME])
-        .arg(APP_NAME)
-        .arg(file_name)
-        .status()
-        .unwrap_or_else(|_| panic!("Failed to execute {COMMAND_NOTIFY_SEND}."));
+#[tracing::instrument]
+fn send_notification(body: &str, icon: &str, sticky: bool) {
+    let mut notification_builder: &mut Notification = &mut Notification::new();
+    notification_builder = notification_builder
+        .summary(APP_NAME)
+        .body(body)
+        .icon(icon)
+        .timeout(EXPIRE_TIME);
+
+    if sticky {
+        notification_builder = notification_builder
+            .timeout(i32::MAX)
+            .hint(Hint::Resident(true));
+    }
+
+    let result = notification_builder.finalize().show();
+    if result.is_err() {
+        error!("Failed to send notification.");
+    }
+}
+
+#[tracing::instrument]
+fn send_wallpaper_changed_notification(selected_file: &PathBuf) {
+    send_notification(
+        get_file_name(selected_file).as_str(),
+        &selected_file.to_string_lossy(),
+        false,
+    )
 }
 
 fn main() {
-    let cache_file_path = get_cache_file_path();
-    let previous_background = get_previously_selected_background(&cache_file_path);
-    let wallpaper_directory_path = get_wallpaper_directory_path();
-    let possible_backgrounds =
-        get_possible_backgrounds(previous_background, &wallpaper_directory_path);
+    setup_tracing_subscriber();
 
-    if possible_backgrounds.is_empty() {
-        println!(
-            "No images found in {}.",
-            &wallpaper_directory_path.display()
+    let cache_file_path = get_cache_file_path();
+    let previous_wallpaper = get_previously_used_wallpaper(&cache_file_path);
+    let wallpaper_directory_path = get_wallpaper_directory_path();
+    let possible_wallpapers =
+        get_possible_wallpapers(previous_wallpaper, &wallpaper_directory_path);
+
+    if possible_wallpapers.is_empty() {
+        warn!("No images found in {}", &wallpaper_directory_path.display());
+        send_notification(
+            format!("No images found in {}", &wallpaper_directory_path.display()).as_str(),
+            "dialog-warning",
+            true,
         );
         return;
     }
 
-    let selected_file = choose_random_background(&possible_backgrounds);
-    let file_name = get_file_name(&selected_file);
-
-    apply_new_background(&cache_file_path, &selected_file, file_name);
+    let selected_file = choose_random_wallpaper(&possible_wallpapers);
+    apply_new_wallpaper(&cache_file_path, selected_file);
 }
