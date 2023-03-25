@@ -1,6 +1,6 @@
 # Random Wallpaper
 
-Simple application to randomly apply a wallpaper.
+Simple application to randomly apply a wallpaper from a given folder.
 
 Made for [Wayland](https://wayland.freedesktop.org/) on [Arch Linux](https://archlinux.org/)
 
