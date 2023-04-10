@@ -1,0 +1,17 @@
+#!/usr/bin/env fish
+
+set wallpapers_dir "$HOME/Pictures/wallpapers"
+
+if not test -d $wallpapers_dir
+    mkdir $wallpapers_dir
+    cd -
+    cp sample-wallpapers/* $wallpapers_dir
+
+    echo "sample wallpapers copied to $wallpapers_dir"
+end
+
+if not type -q random-wallpaper
+    cargo install --path .
+else
+    echo "random-wallpaper available"
+end
